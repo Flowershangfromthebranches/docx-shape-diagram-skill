@@ -1,0 +1,4 @@
+interface:
+  display_name: "DOCX Shape Diagram"
+  short_description: "Editable DOCX shape diagrams"
+  default_prompt: "Convert or create editable Word shape diagrams in my DOCX document."
