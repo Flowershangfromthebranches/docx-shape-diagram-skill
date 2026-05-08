@@ -26,6 +26,7 @@ Use editable Word drawing objects for diagrams in `.docx` documents. Do not sati
    - Use `references/shape-spec.md` for the JSON schema.
    - Use `references/diagram-detection.md` for choosing diagram type and placement.
    - Prefer clean reconstruction over pixel-perfect tracing: readable layout, editable shapes, and correct relationships matter more than exact raster geometry.
+   - Do not hand-place messy coordinates. Leave `layout.mode` as `auto` unless the user provides exact geometry. The script will snap nodes to a layered grid, standardize box sizes, deduplicate repeated connectors, and route arrows cleanly.
    - Mark uncertain labels, arrow directions, or relationships in the final response.
 
 4. **Apply editable shapes**
@@ -33,7 +34,8 @@ Use editable Word drawing objects for diagrams in `.docx` documents. Do not sati
      ```bash
      python3 scripts/docx_shape_diagram.py apply <input.docx> --spec <diagram.json> --out <output.docx>
      ```
-   - The script writes editable VML/Word drawing shapes into the DOCX. If precise Word-native editing is required, use LibreOffice UNO or Microsoft Word automation guidance in `references/tooling.md`.
+   - The script writes editable VML/Word drawing shapes into the DOCX. Auto layout is the default; use `--layout manual` only for carefully measured coordinates.
+   - If precise Word-native editing is required, use LibreOffice UNO or Microsoft Word automation guidance in `references/tooling.md`.
 
 5. **Validate**
    - Run:
@@ -48,6 +50,8 @@ Use editable Word drawing objects for diagrams in `.docx` documents. Do not sati
 - For a specified prompt location, use `placement.mode: "placeholder"` with exact marker text, or `placement.mode: "paragraph_index"`.
 - For inferred diagrams, insert after the paragraph or heading that introduces the process/model/interaction.
 - Keep diagram width within the page text area; use compact labels and route connectors so text does not overlap lines.
+- For generated diagrams, use a top-down layered structure by default. Avoid diagonal connector tangles, duplicate arrows, oversized text, and boxes that are too short for their labels.
+- Keep generated diagrams page-friendly by default. Use wider canvases only when the user asks for landscape output or a wide architecture map.
 
 ## Tooling Preference
 

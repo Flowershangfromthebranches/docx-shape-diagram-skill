@@ -9,6 +9,7 @@ It is designed for flowcharts, sequence diagrams, E-R diagrams, decision diagram
 - Analyzes `.docx` files for embedded raster images and nearby text.
 - Scores likely line/shape diagrams so photos and decorative images can be preserved.
 - Uses a JSON shape spec for nodes, connectors, labels, and placement.
+- Normalizes generated diagrams onto a clean layered grid by default.
 - Writes editable Word drawing shapes into `.docx` output files.
 - Supports prompt-driven insertion at placeholders, paragraph indexes, raster image positions, or the end of a document.
 - Provides validation to confirm the output contains editable shapes.
@@ -41,6 +42,8 @@ Apply an editable shape diagram from a JSON spec:
 python3 scripts/docx_shape_diagram.py apply input.docx --spec diagram.json --out output.docx
 ```
 
+`apply` uses auto layout by default so rough specs still produce aligned boxes, wrapped layers, and clean orthogonal connectors. Use `--layout manual` only when the JSON coordinates are already carefully designed.
+
 Validate the output:
 
 ```bash
@@ -52,6 +55,7 @@ Minimal `diagram.json`:
 ```json
 {
   "placement": { "mode": "placeholder", "text": "{{DIAGRAM}}", "replace_text": true },
+  "layout": { "mode": "auto" },
   "canvas": { "width": 432, "height": 240 },
   "nodes": [
     { "id": "start", "type": "rounded_rect", "text": "Start", "x": 24, "y": 48, "width": 100, "height": 44 },
@@ -82,6 +86,7 @@ The bundled script uses direct DOCX markup so it can work headlessly. LibreOffic
 - 分析 `.docx` 中的嵌入图片和上下文文字。
 - 识别更像线框图/流程图的栅格图片，避免误处理照片、装饰图和普通截图。
 - 使用 JSON 规格描述节点、连接线、标签和插入位置。
+- 默认把生成的图自动规整到分层网格，避免节点歪斜、连线混乱和文字溢出。
 - 将图写回为可编辑的 Word 绘图形状。
 - 支持按占位符、段落索引、图片索引或文档末尾插入。
 - 提供验证命令，确认输出文档中包含可编辑绘图形状。
@@ -113,6 +118,8 @@ python3 scripts/docx_shape_diagram.py analyze input.docx
 ```bash
 python3 scripts/docx_shape_diagram.py apply input.docx --spec diagram.json --out output.docx
 ```
+
+`apply` 默认启用自动布局，即使 JSON 里坐标比较粗糙，也会尽量输出对齐的方框、自动换行的层级和规整的折线箭头。只有坐标已经精心设计时才使用 `--layout manual`。
 
 验证输出：
 

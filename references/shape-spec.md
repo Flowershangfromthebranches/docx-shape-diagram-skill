@@ -23,6 +23,43 @@ Use this JSON format when creating editable DOCX diagrams with `scripts/docx_sha
 
 Coordinates are points relative to the top-left of the diagram canvas. Use 72 points per inch.
 
+By default, `apply` ignores rough node coordinates and normalizes the diagram onto a clean layered grid. Add `"layout": { "mode": "manual" }` or pass `--layout manual` only when coordinates are already carefully measured.
+
+## Layout
+
+Recommended generated specs should include semantic relationships first and leave layout to the script:
+
+```json
+{
+  "layout": { "mode": "auto" },
+  "canvas": { "width": 520 },
+  "nodes": [
+    { "id": "system", "type": "rect", "text": "智能停车管理系统" },
+    { "id": "parking", "type": "rect", "text": "车位管理" }
+  ],
+  "connectors": [
+    { "from": "system", "to": "parking", "arrow": true }
+  ]
+}
+```
+
+Auto layout:
+
+- Assigns graph layers from connector direction.
+- Centers each layer on a common canvas.
+- Keeps the canvas within a page-friendly default width of 500pt and wraps crowded layers. Set `layout.max_canvas_width` only when a wider landscape-style diagram is intentional.
+- Uses consistent node widths and heights based on label length.
+- Deduplicates repeated connectors.
+- Routes arrows as simple vertical or orthogonal lines.
+
+Manual layout:
+
+```json
+{ "layout": { "mode": "manual" } }
+```
+
+Use manual mode only when the user provides exact coordinates or when post-processing a known good diagram.
+
 ## Placement
 
 - `mode: "image_index"`: replace the raster image paragraph reported by `analyze`; include `image_index`.
@@ -70,7 +107,9 @@ For E-R diagrams, put cardinalities in `label`, `start_label`, or `end_label`. F
 ## Quality Rules
 
 - Use stable IDs; connectors must refer to existing node IDs.
-- Keep all nodes within the canvas.
+- Prefer auto layout for newly generated diagrams.
+- Keep all nodes within the canvas when using manual layout.
 - Keep labels short enough to fit their boxes.
-- Prefer orthogonal or simple straight connectors. Avoid dense crossing lines.
+- Prefer orthogonal or simple straight connectors. Avoid dense crossing lines and duplicate arrows.
+- Do not create boxes shorter than their labels; CJK labels usually need wider boxes.
 - If raster recognition is uncertain, create a clean approximate spec and report uncertainties.

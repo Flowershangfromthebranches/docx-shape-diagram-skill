@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import os
 import shutil
 import sys
 import tempfile
@@ -234,6 +233,167 @@ def color(value: Any, default: str) -> str:
     return default
 
 
+def text_units(text: str) -> int:
+    """Approximate display width; CJK characters need more room than ASCII."""
+    total = 0
+    for char in text:
+        total += 2 if ord(char) > 127 else 1
+    return total
+
+
+def node_lines(node: dict[str, Any]) -> list[str]:
+    lines = [str(node.get("text", "")).strip()]
+    lines.extend(str(field).strip() for field in node.get("fields") or [])
+    return [line for line in lines if line]
+
+
+def default_node_size(node: dict[str, Any], min_width: float, max_width: float) -> tuple[float, float]:
+    lines = node_lines(node)
+    widest = max((text_units(line) for line in lines), default=8)
+    width = min(max(min_width, widest * 6.2 + 28), max_width)
+    height = 46 + max(0, len(lines) - 1) * 16
+    if str(node.get("type", "")).lower() == "diamond":
+        width = max(width, 78)
+        height = max(height, 64)
+    return width, height
+
+
+def assign_graph_layers(
+    nodes: list[dict[str, Any]], connectors: list[dict[str, Any]]
+) -> dict[str, int]:
+    node_ids = [str(node.get("id")) for node in nodes if node.get("id")]
+    incoming = {node_id: 0 for node_id in node_ids}
+    outgoing: dict[str, list[str]] = {node_id: [] for node_id in node_ids}
+    for connector in connectors:
+        src = str(connector.get("from", ""))
+        dst = str(connector.get("to", ""))
+        if src in outgoing and dst in incoming:
+            outgoing[src].append(dst)
+            incoming[dst] += 1
+
+    queue = [node_id for node_id in node_ids if incoming[node_id] == 0] or node_ids[:1]
+    layers = {node_id: 0 for node_id in node_ids}
+    seen = set(queue)
+    while queue:
+        src = queue.pop(0)
+        for dst in outgoing.get(src, []):
+            layers[dst] = max(layers.get(dst, 0), layers[src] + 1)
+            incoming[dst] -= 1
+            if incoming[dst] <= 0 and dst not in seen:
+                queue.append(dst)
+                seen.add(dst)
+
+    # Cycles and disconnected nodes get stable layers after their predecessors.
+    fallback_layer = max(layers.values(), default=0)
+    for node_id in node_ids:
+        if node_id not in seen:
+            fallback_layer += 1
+            layers[node_id] = fallback_layer
+    return layers
+
+
+def dedupe_connectors(connectors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    deduped: list[dict[str, Any]] = []
+    seen: set[tuple[str, str, str, str]] = set()
+    for connector in connectors:
+        if connector.get("points"):
+            key = ("points", json.dumps(connector.get("points"), sort_keys=True), str(connector.get("label", "")), "")
+        else:
+            key = (
+                str(connector.get("from", "")),
+                str(connector.get("to", "")),
+                str(connector.get("label", "")),
+                str(connector.get("type", "")),
+            )
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(connector)
+    return deduped
+
+
+def chunk_layer(
+    row_nodes: list[dict[str, Any]], available_width: float, h_gap: float
+) -> list[list[dict[str, Any]]]:
+    chunks: list[list[dict[str, Any]]] = []
+    current: list[dict[str, Any]] = []
+    current_width = 0.0
+    for node in row_nodes:
+        node_width = pt(node.get("width"), 118)
+        added_width = node_width if not current else node_width + h_gap
+        if current and current_width + added_width > available_width:
+            chunks.append(current)
+            current = [node]
+            current_width = node_width
+        else:
+            current.append(node)
+            current_width += added_width
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+def normalize_spec(spec: dict[str, Any], layout_override: str | None = None) -> dict[str, Any]:
+    normalized = deepcopy(spec)
+    nodes = normalized.get("nodes") or []
+    connectors = dedupe_connectors(normalized.get("connectors") or [])
+    normalized["connectors"] = connectors
+
+    layout = normalized.get("layout") or {}
+    mode = layout_override or str(layout.get("mode", "auto"))
+    if mode == "manual":
+        return normalized
+
+    margin_x = pt(layout.get("margin_x"), 28)
+    margin_y = pt(layout.get("margin_y"), 28)
+    h_gap = pt(layout.get("h_gap"), 40)
+    v_gap = pt(layout.get("v_gap"), 58)
+    min_width = pt(layout.get("min_node_width"), 118)
+    max_width = pt(layout.get("max_node_width"), 168)
+    canvas = normalized.setdefault("canvas", {})
+    max_canvas_width = pt(layout.get("max_canvas_width"), 500)
+    requested_width = pt(canvas.get("width"), pt(layout.get("canvas_width"), max_canvas_width))
+    canvas_width = min(max(432, requested_width), max_canvas_width)
+    available_width = max(canvas_width - margin_x * 2, min_width)
+
+    for node in nodes:
+        width, height = default_node_size(node, min_width, max_width)
+        node["width"] = pt(node.get("width"), width)
+        node["height"] = pt(node.get("height"), height)
+
+    layers = assign_graph_layers(nodes, connectors)
+    rows: dict[int, list[dict[str, Any]]] = {}
+    for node in nodes:
+        rows.setdefault(layers.get(str(node.get("id")), 0), []).append(node)
+
+    visual_rows: list[list[dict[str, Any]]] = []
+    for layer in sorted(rows):
+        row_nodes = rows[layer]
+        chunks = chunk_layer(row_nodes, available_width, h_gap)
+        if not chunks and row_nodes:
+            chunks = [row_nodes]
+        rows[layer] = row_nodes
+        for chunk in chunks:
+            visual_rows.append(chunk)
+
+    y = margin_y
+    for row_nodes in visual_rows:
+        row_width = sum(pt(n.get("width"), min_width) for n in row_nodes)
+        row_width += h_gap * max(0, len(row_nodes) - 1)
+        row_height = max((pt(n.get("height"), 46) for n in row_nodes), default=46)
+        x = margin_x + max(0, (canvas_width - margin_x * 2 - row_width) / 2)
+        for node in row_nodes:
+            node["x"] = round(x, 2)
+            node["y"] = round(y + (row_height - pt(node.get("height"), 46)) / 2, 2)
+            x += pt(node.get("width"), min_width) + h_gap
+        y += row_height + v_gap
+
+    canvas["width"] = round(canvas_width, 2)
+    canvas["height"] = round(max(pt(canvas.get("height"), 0), y - v_gap + margin_y), 2)
+    route_connectors(normalized)
+    return normalized
+
+
 def node_center(node: dict[str, Any]) -> tuple[float, float]:
     return (
         pt(node.get("x")) + pt(node.get("width"), 80) / 2,
@@ -261,13 +421,21 @@ def style_position(x: float, y: float, width: float, height: float) -> str:
     )
 
 
-def text_box(text: str) -> str:
-    escaped = escape(text or "")
+def text_box(text: str, font_size: int = 10, bold: bool = False) -> str:
+    raw_lines = str(text or "").splitlines() or [""]
+    lines = [escape(line) for line in raw_lines]
+    run_props = f'<w:rPr><w:sz w:val="{font_size * 2}"/><w:szCs w:val="{font_size * 2}"/>'
+    if bold:
+        run_props += "<w:b/><w:bCs/>"
+    run_props += "</w:rPr>"
+    paragraphs = "".join(
+        "<w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr>"
+        f"<w:r>{run_props}<w:t>{line}</w:t></w:r></w:p>"
+        for line in lines
+    )
     return (
-        '<v:textbox inset="4pt,2pt,4pt,2pt">'
-        "<w:txbxContent><w:p><w:r><w:t>"
-        f"{escaped}"
-        "</w:t></w:r></w:p></w:txbxContent></v:textbox>"
+        '<v:textbox inset="6pt,3pt,6pt,3pt" style="mso-fit-shape-to-text:false">'
+        f"<w:txbxContent>{paragraphs}</w:txbxContent></v:textbox>"
     )
 
 
@@ -284,31 +452,65 @@ def render_node(node: dict[str, Any]) -> str:
     if fields:
         text = text + "\n" + "\n".join(str(f) for f in fields)
     shape_type = str(node.get("type", "rect")).lower()
+    font_size = int(pt(node.get("font_size"), 10))
+    bold = bool(node.get("bold", False))
     common = (
         f'id="{node_id}" style="{style_position(x, y, width, height)}" '
         f'fillcolor="{fill}" strokecolor="{stroke}" strokeweight="1pt"'
     )
     if shape_type == "rounded_rect":
-        return f"<v:roundrect {common} arcsize=\"16%\">{text_box(text)}</v:roundrect>"
+        return f"<v:roundrect {common} arcsize=\"16%\">{text_box(text, font_size, bold)}</v:roundrect>"
     if shape_type == "ellipse":
-        return f"<v:oval {common}>{text_box(text)}</v:oval>"
+        return f"<v:oval {common}>{text_box(text, font_size, bold)}</v:oval>"
     if shape_type == "diamond":
         return (
             f'<v:shape {common} coordsize="21600,21600" '
             'path="m,10800 l10800,21600,21600,10800,10800, xe">'
-            f"{text_box(text)}</v:shape>"
+            f"{text_box(text, font_size, bold)}</v:shape>"
         )
     if shape_type == "lifeline":
         cx = x + width / 2
         bottom = pt(node.get("line_bottom"), y + height + 130)
-        header = f"<v:rect {common}>{text_box(text)}</v:rect>"
+        header = f"<v:rect {common}>{text_box(text, font_size, bold)}</v:rect>"
         line = (
             f'<v:line from="{cx:.2f}pt,{(y + height):.2f}pt" '
             f'to="{cx:.2f}pt,{bottom:.2f}pt" strokecolor="{stroke}" '
             'strokeweight="1pt"><v:stroke dashstyle="dash"/></v:line>'
         )
         return header + line
-    return f"<v:rect {common}>{text_box(text)}</v:rect>"
+    return f"<v:rect {common}>{text_box(text, font_size, bold)}</v:rect>"
+
+
+def route_connectors(spec: dict[str, Any]) -> None:
+    nodes = spec.get("nodes") or []
+    nodes_by_id = {str(n.get("id")): n for n in nodes if n.get("id")}
+    for connector in spec.get("connectors") or []:
+        if connector.get("points"):
+            continue
+        from_node = nodes_by_id.get(str(connector.get("from")))
+        to_node = nodes_by_id.get(str(connector.get("to")))
+        if not from_node or not to_node:
+            continue
+        sx, sy = node_center(from_node)
+        tx, ty = node_center(to_node)
+        if abs(tx - sx) < 4:
+            start = (sx, pt(from_node.get("y")) + pt(from_node.get("height"), 46))
+            end = (tx, pt(to_node.get("y")))
+            connector["points"] = [[round(start[0], 2), round(start[1], 2)], [round(end[0], 2), round(end[1], 2)]]
+        elif ty > sy:
+            start = (sx, pt(from_node.get("y")) + pt(from_node.get("height"), 46))
+            end = (tx, pt(to_node.get("y")))
+            mid_y = round((start[1] + end[1]) / 2, 2)
+            connector["points"] = [
+                [round(start[0], 2), round(start[1], 2)],
+                [round(start[0], 2), mid_y],
+                [round(end[0], 2), mid_y],
+                [round(end[0], 2), round(end[1], 2)],
+            ]
+        else:
+            start = edge_point(from_node, to_node)
+            end = edge_point(to_node, from_node)
+            connector["points"] = [[round(start[0], 2), round(start[1], 2)], [round(end[0], 2), round(end[1], 2)]]
 
 
 def render_connector(connector: dict[str, Any], nodes_by_id: dict[str, dict[str, Any]]) -> str:
@@ -328,13 +530,24 @@ def render_connector(connector: dict[str, Any], nodes_by_id: dict[str, dict[str,
         end = edge_point(to_node, from_node)
 
     stroke = color(connector.get("stroke"), "#1F2937")
-    arrow = " endarrow=\"block\"" if connector.get("arrow", True) else ""
     dash = " dashstyle=\"dash\"" if connector.get("dash") else ""
-    line = (
-        f'<v:line from="{start[0]:.2f}pt,{start[1]:.2f}pt" '
-        f'to="{end[0]:.2f}pt,{end[1]:.2f}pt" strokecolor="{stroke}" '
-        f'strokeweight="1pt"><v:stroke{arrow}{dash}/></v:line>'
-    )
+    if points and len(parsed) > 2:
+        segments = []
+        for idx, (seg_start, seg_end) in enumerate(zip(parsed, parsed[1:])):
+            arrow = " endarrow=\"block\"" if idx == len(parsed) - 2 and connector.get("arrow", True) else ""
+            segments.append(
+                f'<v:line from="{seg_start[0]:.2f}pt,{seg_start[1]:.2f}pt" '
+                f'to="{seg_end[0]:.2f}pt,{seg_end[1]:.2f}pt" strokecolor="{stroke}" '
+                f'strokeweight="1pt"><v:stroke{arrow}{dash}/></v:line>'
+            )
+        line = "".join(segments)
+    else:
+        arrow = " endarrow=\"block\"" if connector.get("arrow", True) else ""
+        line = (
+            f'<v:line from="{start[0]:.2f}pt,{start[1]:.2f}pt" '
+            f'to="{end[0]:.2f}pt,{end[1]:.2f}pt" strokecolor="{stroke}" '
+            f'strokeweight="1pt"><v:stroke{arrow}{dash}/></v:line>'
+        )
     label = str(connector.get("label", "")).strip()
     if label:
         mx = (start[0] + end[0]) / 2 - 28
@@ -352,7 +565,7 @@ def render_label(label: dict[str, Any]) -> str:
     return (
         f'<v:shape style="{style_position(x, y, width, height)}" '
         'filled="false" stroked="false">'
-        f"{text_box(text)}</v:shape>"
+        f"{text_box(text, 9)}</v:shape>"
     )
 
 
@@ -363,18 +576,18 @@ def render_diagram_paragraph(spec: dict[str, Any]) -> etree._Element:
     nodes = spec.get("nodes") or []
     nodes_by_id = {str(n.get("id")): n for n in nodes if n.get("id")}
     labels = "".join(render_label(label) for label in spec.get("labels", []) or [])
-    rendered_nodes = "".join(render_node(node) for node in nodes)
     rendered_connectors = "".join(
         render_connector(connector, nodes_by_id)
         for connector in spec.get("connectors", []) or []
     )
+    rendered_nodes = "".join(render_node(node) for node in nodes)
     group = (
         f'<w:p xmlns:w="{NS["w"]}" xmlns:v="{NS["v"]}" xmlns:o="{NS["o"]}">'
         "<w:r><w:pict>"
         f'<v:group id="docx_shape_diagram" '
         f'style="width:{width:.2f}pt;height:{height:.2f}pt;position:relative" '
         f'coordsize="{int(width)},{int(height)}">'
-        f"{labels}{rendered_connectors}{rendered_nodes}"
+        f"{rendered_connectors}{rendered_nodes}{labels}"
         "</v:group></w:pict></w:r></w:p>"
     )
     return etree.fromstring(group.encode("utf-8"))
@@ -449,6 +662,12 @@ def apply_spec(args: argparse.Namespace) -> int:
     input_path = Path(args.input_docx)
     output_path = Path(args.out)
     spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    spec = normalize_spec(spec, args.layout)
+    if args.dump_normalized_spec:
+        Path(args.dump_normalized_spec).write_text(
+            json.dumps(spec, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     root = load_xml_from_docx(input_path, "word/document.xml")
     diagram_p = render_diagram_paragraph(spec)
     insert_or_replace(root, diagram_p, spec)
@@ -479,7 +698,7 @@ def validate_docx(args: argparse.Namespace) -> int:
         names = zf.namelist()
         document = etree.fromstring(zf.read("word/document.xml"))
         media = [name for name in names if name.startswith("word/media/")]
-    vml_shapes = document.xpath("count(.//v:shape | .//v:rect | .//v:roundrect | .//v:oval | .//v:line | .//v:group)", namespaces=NS)
+    vml_shapes = document.xpath("count(.//v:shape | .//v:rect | .//v:roundrect | .//v:oval | .//v:line | .//v:polyline | .//v:group)", namespaces=NS)
     drawing_images = document.xpath("count(.//a:blip | .//v:imagedata)", namespaces=NS)
     report = {
         "input": str(docx_path),
@@ -506,6 +725,13 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("input_docx")
     apply.add_argument("--spec", required=True)
     apply.add_argument("--out", required=True)
+    apply.add_argument(
+        "--layout",
+        choices=["auto", "manual"],
+        default=None,
+        help="Default auto normalizes nodes onto a clean layered grid; manual preserves coordinates",
+    )
+    apply.add_argument("--dump-normalized-spec", help="Write the normalized spec used for rendering")
     apply.set_defaults(func=apply_spec)
 
     validate = sub.add_parser("validate", help="Validate editable shape presence in a DOCX")
