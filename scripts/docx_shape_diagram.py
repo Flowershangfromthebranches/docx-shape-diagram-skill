@@ -7,6 +7,7 @@ import argparse
 import json
 import math
 import shutil
+import subprocess
 import sys
 import tempfile
 import zipfile
@@ -213,6 +214,7 @@ def analyze_docx(args: argparse.Namespace) -> int:
             if Path("/Applications/LibreOffice.app/Contents/MacOS/soffice").exists()
             else None
         ),
+        "graphviz_dot": shutil.which("dot"),
         "images": images,
     }
     json.dump(report, sys.stdout, ensure_ascii=False, indent=2)
@@ -333,6 +335,185 @@ def chunk_layer(
     return chunks
 
 
+def dot_id(index: int) -> str:
+    return f"n{index}"
+
+
+def graphviz_layout_spec(
+    spec: dict[str, Any],
+    margin_x: float,
+    margin_y: float,
+    h_gap: float,
+    v_gap: float,
+) -> bool:
+    dot = shutil.which("dot")
+    if not dot:
+        return False
+
+    nodes = spec.get("nodes") or []
+    connectors = spec.get("connectors") or []
+    node_ids = [str(node.get("id")) for node in nodes if node.get("id")]
+    if not nodes or not node_ids:
+        return False
+
+    id_to_dot = {node_id: dot_id(index) for index, node_id in enumerate(node_ids)}
+    lines = [
+        "digraph G {",
+        "graph [rankdir=TB, splines=ortho, outputorder=edgesfirst, ordering=out, "
+        f'nodesep="{max(h_gap / 72, 0.25):.2f}", ranksep="{max(v_gap / 72, 0.35):.2f}"];',
+        'node [shape=box, fixedsize=true, label="", margin=0];',
+        'edge [arrowsize=0.7];',
+    ]
+    for node in nodes:
+        node_id = str(node.get("id"))
+        if node_id not in id_to_dot:
+            continue
+        width_in = max(pt(node.get("width"), 118) / 72, 0.2)
+        height_in = max(pt(node.get("height"), 46) / 72, 0.2)
+        lines.append(f'{id_to_dot[node_id]} [width="{width_in:.3f}", height="{height_in:.3f}"];')
+    for connector in connectors:
+        if connector.get("points"):
+            continue
+        src = id_to_dot.get(str(connector.get("from", "")))
+        dst = id_to_dot.get(str(connector.get("to", "")))
+        if src and dst:
+            lines.append(f"{src} -> {dst};")
+    lines.append("}")
+
+    try:
+        result = subprocess.run(
+            [dot, "-Tplain"],
+            input="\n".join(lines),
+            text=True,
+            capture_output=True,
+            check=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return False
+
+    graph_width = 0.0
+    graph_height = 0.0
+    dot_positions: dict[str, tuple[float, float]] = {}
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if not parts:
+            continue
+        if parts[0] == "graph" and len(parts) >= 4:
+            graph_width = float(parts[2]) * 72
+            graph_height = float(parts[3]) * 72
+        elif parts[0] == "node" and len(parts) >= 6:
+            dot_positions[parts[1]] = (float(parts[2]) * 72, float(parts[3]) * 72)
+
+    if not graph_width or not graph_height or len(dot_positions) != len(node_ids):
+        return False
+
+    dot_to_id = {value: key for key, value in id_to_dot.items()}
+    for dot_name, (cx, cy) in dot_positions.items():
+        node_id = dot_to_id.get(dot_name)
+        if node_id is None:
+            continue
+        node = next((n for n in nodes if str(n.get("id")) == node_id), None)
+        if node is None:
+            continue
+        width = pt(node.get("width"), 118)
+        height = pt(node.get("height"), 46)
+        node["x"] = round(margin_x + cx - width / 2, 2)
+        node["y"] = round(margin_y + (graph_height - cy) - height / 2, 2)
+
+    canvas = spec.setdefault("canvas", {})
+    canvas["width"] = round(graph_width + margin_x * 2, 2)
+    canvas["height"] = round(graph_height + margin_y * 2, 2)
+    route_connectors(spec)
+    return True
+
+
+def compact_tree_layout_spec(
+    spec: dict[str, Any],
+    margin_x: float,
+    margin_y: float,
+    h_gap: float,
+    v_gap: float,
+    canvas_width: float,
+) -> bool:
+    nodes = spec.get("nodes") or []
+    connectors = spec.get("connectors") or []
+    nodes_by_id = {str(node.get("id")): node for node in nodes if node.get("id")}
+    if len(nodes_by_id) < 3:
+        return False
+
+    children: dict[str, list[str]] = {node_id: [] for node_id in nodes_by_id}
+    incoming: dict[str, int] = {node_id: 0 for node_id in nodes_by_id}
+    for connector in connectors:
+        if connector.get("points"):
+            continue
+        src = str(connector.get("from", ""))
+        dst = str(connector.get("to", ""))
+        if src in nodes_by_id and dst in nodes_by_id and dst not in children[src]:
+            children[src].append(dst)
+            incoming[dst] += 1
+
+    roots = [node_id for node_id, count in incoming.items() if count == 0]
+    if len(roots) != 1 or len(children.get(roots[0], [])) < 2:
+        return False
+
+    root_id = roots[0]
+    root = nodes_by_id[root_id]
+    top_children = children[root_id]
+    available = max(canvas_width - margin_x * 2, 1)
+    column_width = available / max(len(top_children), 1)
+    if column_width < 95:
+        return False
+
+    root["x"] = round((canvas_width - pt(root.get("width"), 118)) / 2, 2)
+    root["y"] = round(margin_y, 2)
+    start_y = margin_y + pt(root.get("height"), 46) + v_gap
+    y_gap = max(24, v_gap * 0.45)
+    placed: set[str] = {root_id}
+    max_y = start_y
+
+    def place_branch(node_id: str, center_x: float, y: float, seen: set[str]) -> float:
+        nonlocal max_y
+        if node_id in seen or node_id not in nodes_by_id:
+            return y
+        seen.add(node_id)
+        placed.add(node_id)
+        node = nodes_by_id[node_id]
+        width = pt(node.get("width"), 118)
+        height = pt(node.get("height"), 46)
+        node["x"] = round(center_x - width / 2, 2)
+        node["y"] = round(y, 2)
+        max_y = max(max_y, y + height)
+        next_y = y + height + y_gap
+        for child_id in children.get(node_id, []):
+            if child_id in seen:
+                continue
+            next_y = place_branch(child_id, center_x, next_y, seen)
+        return next_y
+
+    for index, child_id in enumerate(top_children):
+        center_x = margin_x + column_width * (index + 0.5)
+        place_branch(child_id, center_x, start_y, set())
+
+    # Disconnected or shared nodes get a stable bottom row instead of disappearing.
+    leftovers = [node_id for node_id in nodes_by_id if node_id not in placed]
+    if leftovers:
+        y = max_y + y_gap
+        row_width = sum(pt(nodes_by_id[node_id].get("width"), 118) for node_id in leftovers)
+        row_width += h_gap * max(0, len(leftovers) - 1)
+        x = margin_x + max(0, (available - row_width) / 2)
+        for node_id in leftovers:
+            node = nodes_by_id[node_id]
+            node["x"] = round(x, 2)
+            node["y"] = round(y, 2)
+            x += pt(node.get("width"), 118) + h_gap
+            max_y = max(max_y, y + pt(node.get("height"), 46))
+
+    spec.setdefault("canvas", {})["width"] = round(canvas_width, 2)
+    spec["canvas"]["height"] = round(max_y + margin_y, 2)
+    route_connectors(spec)
+    return True
+
+
 def normalize_spec(spec: dict[str, Any], layout_override: str | None = None) -> dict[str, Any]:
     normalized = deepcopy(spec)
     nodes = normalized.get("nodes") or []
@@ -360,6 +541,14 @@ def normalize_spec(spec: dict[str, Any], layout_override: str | None = None) -> 
         width, height = default_node_size(node, min_width, max_width)
         node["width"] = pt(node.get("width"), width)
         node["height"] = pt(node.get("height"), height)
+
+    engine = str(layout.get("engine", "compact-tree"))
+    if engine in {"compact-tree", "tree"} and compact_tree_layout_spec(
+        normalized, margin_x, margin_y, h_gap, v_gap, canvas_width
+    ):
+        return normalized
+    if engine != "grid" and graphviz_layout_spec(normalized, margin_x, margin_y, h_gap, v_gap):
+        return normalized
 
     layers = assign_graph_layers(nodes, connectors)
     rows: dict[int, list[dict[str, Any]]] = {}
@@ -421,32 +610,57 @@ def style_position(x: float, y: float, width: float, height: float) -> str:
     )
 
 
-def text_box(text: str, font_size: int = 10, bold: bool = False) -> str:
+def vml_coord(value: float, scale: float) -> int:
+    return int(round(value * scale))
+
+
+def vml_style(x: int, y: int, width: int, height: int, anchor: bool = True) -> str:
+    style = f"position:absolute;left:{x};top:{y};width:{width};height:{height}"
+    if anchor:
+        style += ";v-text-anchor:middle"
+    return style
+
+
+def vml_textbox(
+    text: str,
+    font_size: int = 10,
+    bold: bool = False,
+    color_value: str = "#000000",
+    inset: str = "4pt,2pt,4pt,2pt",
+) -> str:
     raw_lines = str(text or "").splitlines() or [""]
     lines = [escape(line) for line in raw_lines]
-    run_props = f'<w:rPr><w:sz w:val="{font_size * 2}"/><w:szCs w:val="{font_size * 2}"/>'
-    if bold:
-        run_props += "<w:b/><w:bCs/>"
-    run_props += "</w:rPr>"
-    paragraphs = "".join(
+    font_color = color(color_value, "#000000").lstrip("#")
+    paragraphs = []
+    for index, line in enumerate(lines):
+        line_size = font_size if index == 0 else max(7, font_size - 1)
+        run_props = (
+            '<w:rPr><w:rFonts w:eastAsia="宋体" w:ascii="Times New Roman" '
+            'w:hAnsi="Times New Roman" w:cs="Times New Roman"/>'
+            f'<w:sz w:val="{line_size * 2}"/><w:szCs w:val="{line_size * 2}"/>'
+            f'<w:color w:val="{font_color}"/>'
+        )
+        if bold and index == 0:
+            run_props += "<w:b/><w:bCs/>"
+        run_props += "</w:rPr>"
+        paragraphs.append(
         "<w:p><w:pPr><w:jc w:val=\"center\"/></w:pPr>"
         f"<w:r>{run_props}<w:t>{line}</w:t></w:r></w:p>"
-        for line in lines
-    )
+        )
     return (
-        '<v:textbox inset="6pt,3pt,6pt,3pt" style="mso-fit-shape-to-text:false">'
-        f"<w:txbxContent>{paragraphs}</w:txbxContent></v:textbox>"
+        f'<v:textbox inset="{inset}" style="mso-fit-shape-to-text:false">'
+        f"<w:txbxContent>{''.join(paragraphs)}</w:txbxContent></v:textbox>"
     )
 
 
-def render_node(node: dict[str, Any]) -> str:
-    node_id = escape(str(node.get("id", "node")))
-    x = pt(node.get("x"))
-    y = pt(node.get("y"))
-    width = pt(node.get("width"), 100)
-    height = pt(node.get("height"), 44)
+def render_node(node: dict[str, Any], sid: int, scale: float) -> str:
+    x = vml_coord(pt(node.get("x")), scale)
+    y = vml_coord(pt(node.get("y")), scale)
+    width = max(1, vml_coord(pt(node.get("width"), 100), scale))
+    height = max(1, vml_coord(pt(node.get("height"), 44), scale))
     fill = color(node.get("fill"), "#FFFFFF")
-    stroke = color(node.get("stroke"), "#1F2937")
+    stroke = color(node.get("stroke"), "#000000")
+    font_color = color(node.get("font_color"), "#000000")
     text = str(node.get("text", ""))
     fields = node.get("fields") or []
     if fields:
@@ -455,30 +669,32 @@ def render_node(node: dict[str, Any]) -> str:
     font_size = int(pt(node.get("font_size"), 10))
     bold = bool(node.get("bold", False))
     common = (
-        f'id="{node_id}" style="{style_position(x, y, width, height)}" '
-        f'fillcolor="{fill}" strokecolor="{stroke}" strokeweight="1pt"'
+        f'id="docx_shape_node_{sid}" o:spid="_x0000_s{2000 + sid}" '
+        f'style="{vml_style(x, y, width, height)}" fillcolor="{fill}" '
+        f'filled="t" stroked="t" strokecolor="{stroke}" strokeweight="1pt" '
+        'coordsize="21600,21600"'
     )
-    if shape_type == "rounded_rect":
-        return f"<v:roundrect {common} arcsize=\"16%\">{text_box(text, font_size, bold)}</v:roundrect>"
+    textbox = vml_textbox(text, font_size, bold, font_color)
+    if shape_type in {"rounded_rect", "rect", "entity"}:
+        return f'<v:roundrect {common} o:spt="2" arcsize="0.08">{textbox}</v:roundrect>'
     if shape_type == "ellipse":
-        return f"<v:oval {common}>{text_box(text, font_size, bold)}</v:oval>"
+        return f'<v:oval {common} o:spt="3">{textbox}</v:oval>'
     if shape_type == "diamond":
         return (
-            f'<v:shape {common} coordsize="21600,21600" '
-            'path="m,10800 l10800,21600,21600,10800,10800, xe">'
-            f"{text_box(text, font_size, bold)}</v:shape>"
+            f'<v:shape {common} o:spt="4" type="#_x0000_t4">'
+            f"{textbox}</v:shape>"
         )
     if shape_type == "lifeline":
         cx = x + width / 2
-        bottom = pt(node.get("line_bottom"), y + height + 130)
-        header = f"<v:rect {common}>{text_box(text, font_size, bold)}</v:rect>"
+        bottom = vml_coord(pt(node.get("line_bottom"), pt(node.get("y")) + pt(node.get("height"), 44) + 130), scale)
+        header = f'<v:roundrect {common} o:spt="2" arcsize="0.08">{textbox}</v:roundrect>'
         line = (
-            f'<v:line from="{cx:.2f}pt,{(y + height):.2f}pt" '
-            f'to="{cx:.2f}pt,{bottom:.2f}pt" strokecolor="{stroke}" '
-            'strokeweight="1pt"><v:stroke dashstyle="dash"/></v:line>'
+            f'<v:line id="docx_shape_lifeline_{sid}" o:spid="_x0000_s{3000 + sid}" '
+            f'style="position:absolute" from="{int(cx)},{y + height}" to="{int(cx)},{bottom}" '
+            f'strokecolor="{stroke}" strokeweight="1pt"><v:stroke dashstyle="dash"/></v:line>'
         )
         return header + line
-    return f"<v:rect {common}>{text_box(text, font_size, bold)}</v:rect>"
+    return f'<v:roundrect {common} o:spt="2" arcsize="0.08">{textbox}</v:roundrect>'
 
 
 def route_connectors(spec: dict[str, Any]) -> None:
@@ -496,7 +712,16 @@ def route_connectors(spec: dict[str, Any]) -> None:
         if abs(tx - sx) < 4:
             start = (sx, pt(from_node.get("y")) + pt(from_node.get("height"), 46))
             end = (tx, pt(to_node.get("y")))
-            connector["points"] = [[round(start[0], 2), round(start[1], 2)], [round(end[0], 2), round(end[1], 2)]]
+            if end[1] - start[1] > 100:
+                side = sx + max(pt(from_node.get("width"), 118), pt(to_node.get("width"), 118)) / 2 + 18
+                connector["points"] = [
+                    [round(start[0], 2), round(start[1], 2)],
+                    [round(side, 2), round(start[1], 2)],
+                    [round(side, 2), round(end[1], 2)],
+                    [round(end[0], 2), round(end[1], 2)],
+                ]
+            else:
+                connector["points"] = [[round(start[0], 2), round(start[1], 2)], [round(end[0], 2), round(end[1], 2)]]
         elif ty > sy:
             start = (sx, pt(from_node.get("y")) + pt(from_node.get("height"), 46))
             end = (tx, pt(to_node.get("y")))
@@ -513,7 +738,12 @@ def route_connectors(spec: dict[str, Any]) -> None:
             connector["points"] = [[round(start[0], 2), round(start[1], 2)], [round(end[0], 2), round(end[1], 2)]]
 
 
-def render_connector(connector: dict[str, Any], nodes_by_id: dict[str, dict[str, Any]]) -> str:
+def render_connector(
+    connector: dict[str, Any],
+    nodes_by_id: dict[str, dict[str, Any]],
+    sid: int,
+    scale: float,
+) -> str:
     points = connector.get("points")
     if points:
         parsed = [(pt(p[0]), pt(p[1])) for p in points if isinstance(p, list) and len(p) >= 2]
@@ -529,43 +759,49 @@ def render_connector(connector: dict[str, Any], nodes_by_id: dict[str, dict[str,
         start = edge_point(from_node, to_node)
         end = edge_point(to_node, from_node)
 
-    stroke = color(connector.get("stroke"), "#1F2937")
+    stroke = color(connector.get("stroke"), "#000000")
     dash = " dashstyle=\"dash\"" if connector.get("dash") else ""
     if points and len(parsed) > 2:
         segments = []
         for idx, (seg_start, seg_end) in enumerate(zip(parsed, parsed[1:])):
             arrow = " endarrow=\"block\"" if idx == len(parsed) - 2 and connector.get("arrow", True) else ""
+            x1, y1 = vml_coord(seg_start[0], scale), vml_coord(seg_start[1], scale)
+            x2, y2 = vml_coord(seg_end[0], scale), vml_coord(seg_end[1], scale)
             segments.append(
-                f'<v:line from="{seg_start[0]:.2f}pt,{seg_start[1]:.2f}pt" '
-                f'to="{seg_end[0]:.2f}pt,{seg_end[1]:.2f}pt" strokecolor="{stroke}" '
+                f'<v:line id="docx_shape_line_{sid}_{idx}" o:spid="_x0000_s{4000 + sid * 10 + idx}" '
+                f'style="position:absolute" from="{x1},{y1}" to="{x2},{y2}" strokecolor="{stroke}" '
                 f'strokeweight="1pt"><v:stroke{arrow}{dash}/></v:line>'
             )
         line = "".join(segments)
     else:
         arrow = " endarrow=\"block\"" if connector.get("arrow", True) else ""
+        x1, y1 = vml_coord(start[0], scale), vml_coord(start[1], scale)
+        x2, y2 = vml_coord(end[0], scale), vml_coord(end[1], scale)
         line = (
-            f'<v:line from="{start[0]:.2f}pt,{start[1]:.2f}pt" '
-            f'to="{end[0]:.2f}pt,{end[1]:.2f}pt" strokecolor="{stroke}" '
+            f'<v:line id="docx_shape_line_{sid}" o:spid="_x0000_s{4000 + sid}" '
+            f'style="position:absolute" from="{x1},{y1}" to="{x2},{y2}" strokecolor="{stroke}" '
             f'strokeweight="1pt"><v:stroke{arrow}{dash}/></v:line>'
         )
     label = str(connector.get("label", "")).strip()
     if label:
         mx = (start[0] + end[0]) / 2 - 28
         my = (start[1] + end[1]) / 2 - 10
-        line += render_label({"text": label, "x": mx, "y": my, "width": 56, "height": 18})
+        line += render_label({"text": label, "x": mx, "y": my, "width": 56, "height": 18}, sid, scale)
     return line
 
 
-def render_label(label: dict[str, Any]) -> str:
-    x = pt(label.get("x"))
-    y = pt(label.get("y"))
-    width = pt(label.get("width"), 120)
-    height = pt(label.get("height"), 22)
+def render_label(label: dict[str, Any], sid: int, scale: float) -> str:
+    x = vml_coord(pt(label.get("x")), scale)
+    y = vml_coord(pt(label.get("y")), scale)
+    width = max(1, vml_coord(pt(label.get("width"), 120), scale))
+    height = max(1, vml_coord(pt(label.get("height"), 22), scale))
     text = str(label.get("text", ""))
     return (
-        f'<v:shape style="{style_position(x, y, width, height)}" '
-        'filled="false" stroked="false">'
-        f"{text_box(text, 9)}</v:shape>"
+        f'<v:roundrect id="docx_shape_label_{sid}" o:spid="_x0000_s{5000 + sid}" '
+        f'style="{vml_style(x, y, width, height)}" arcsize="0.08" '
+        'fillcolor="#FFFFFF" filled="t" stroked="f" coordsize="21600,21600">'
+        '<v:stroke on="f"/>'
+        f"{vml_textbox(text, 8, False, '#000000', '2pt,1pt,2pt,1pt')}</v:roundrect>"
     )
 
 
@@ -573,20 +809,29 @@ def render_diagram_paragraph(spec: dict[str, Any]) -> etree._Element:
     canvas = spec.get("canvas") or {}
     width = pt(canvas.get("width"), 432)
     height = pt(canvas.get("height"), 240)
+    coord_width = int(pt(canvas.get("coord_width"), 10000))
+    scale = coord_width / max(width, 1)
+    coord_height = max(1, int(round(height * scale)))
     nodes = spec.get("nodes") or []
     nodes_by_id = {str(n.get("id")): n for n in nodes if n.get("id")}
-    labels = "".join(render_label(label) for label in spec.get("labels", []) or [])
-    rendered_connectors = "".join(
-        render_connector(connector, nodes_by_id)
-        for connector in spec.get("connectors", []) or []
+    labels = "".join(
+        render_label(label, idx, scale)
+        for idx, label in enumerate(spec.get("labels", []) or [], start=1)
     )
-    rendered_nodes = "".join(render_node(node) for node in nodes)
+    rendered_connectors = "".join(
+        render_connector(connector, nodes_by_id, idx, scale)
+        for idx, connector in enumerate(spec.get("connectors", []) or [], start=1)
+    )
+    rendered_nodes = "".join(
+        render_node(node, idx, scale) for idx, node in enumerate(nodes, start=1)
+    )
     group = (
         f'<w:p xmlns:w="{NS["w"]}" xmlns:v="{NS["v"]}" xmlns:o="{NS["o"]}">'
-        "<w:r><w:pict>"
-        f'<v:group id="docx_shape_diagram" '
-        f'style="width:{width:.2f}pt;height:{height:.2f}pt;position:relative" '
-        f'coordsize="{int(width)},{int(height)}">'
+        '<w:pPr><w:keepLines/><w:jc w:val="center"/></w:pPr><w:r><w:pict>'
+        '<v:group id="docx_shape_diagram" o:spid="_x0000_s1999" o:spt="203" '
+        f'style="position:relative;width:{width:.2f}pt;height:{height:.2f}pt" '
+        f'coordorigin="0,0" coordsize="{coord_width},{coord_height}">'
+        '<o:lock v:ext="edit" aspectratio="f"/>'
         f"{rendered_connectors}{rendered_nodes}{labels}"
         "</v:group></w:pict></w:r></w:p>"
     )
@@ -662,6 +907,8 @@ def apply_spec(args: argparse.Namespace) -> int:
     input_path = Path(args.input_docx)
     output_path = Path(args.out)
     spec = json.loads(Path(args.spec).read_text(encoding="utf-8"))
+    if args.engine:
+        spec.setdefault("layout", {})["engine"] = args.engine
     spec = normalize_spec(spec, args.layout)
     if args.dump_normalized_spec:
         Path(args.dump_normalized_spec).write_text(
@@ -730,6 +977,11 @@ def build_parser() -> argparse.ArgumentParser:
         choices=["auto", "manual"],
         default=None,
         help="Default auto normalizes nodes onto a clean layered grid; manual preserves coordinates",
+    )
+    apply.add_argument(
+        "--engine",
+        choices=["compact-tree", "graphviz", "grid"],
+        help="Auto-layout engine. compact-tree is best for system/module structure charts.",
     )
     apply.add_argument("--dump-normalized-spec", help="Write the normalized spec used for rendering")
     apply.set_defaults(func=apply_spec)

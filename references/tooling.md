@@ -2,9 +2,11 @@
 
 ## Deterministic Script Path
 
-`scripts/docx_shape_diagram.py` reads and writes `.docx` packages directly. It inserts editable VML drawing objects, which Microsoft Word and LibreOffice can open as editable shapes. This avoids raster screenshots and works in headless environments.
+`scripts/docx_shape_diagram.py` reads and writes `.docx` packages directly. It inserts editable VML drawing groups with virtual coordinates, Word shape metadata, `from/to` line segments, and Word text boxes. This mirrors the hand-patched diagram approach that renders cleanly in Word/LibreOffice while avoiding raster screenshots.
 
 Use this path first when the goal is a reliable editable diagram in a Word document.
+
+When available, Graphviz `dot` is used for general directed layout. The script falls back to deterministic internal layout when `dot` is absent.
 
 ## LibreOffice UNO Enhancement
 
@@ -19,6 +21,8 @@ Use LibreOffice when you need visual inspection, layout adjustment, or conversio
 ```bash
 /Applications/LibreOffice.app/Contents/MacOS/soffice --headless --convert-to pdf --outdir /tmp <output.docx>
 ```
+
+For important outputs, convert to PDF and rasterize a page PNG for visual QA. Do not trust XML validation alone; it cannot catch clipping, excessive spacing, or awkward line routing.
 
 For deeper automation, launch a UNO listener:
 

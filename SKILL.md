@@ -26,7 +26,8 @@ Use editable Word drawing objects for diagrams in `.docx` documents. Do not sati
    - Use `references/shape-spec.md` for the JSON schema.
    - Use `references/diagram-detection.md` for choosing diagram type and placement.
    - Prefer clean reconstruction over pixel-perfect tracing: readable layout, editable shapes, and correct relationships matter more than exact raster geometry.
-   - Do not hand-place messy coordinates. Leave `layout.mode` as `auto` unless the user provides exact geometry. The script will snap nodes to a layered grid, standardize box sizes, deduplicate repeated connectors, and route arrows cleanly.
+   - Do not hand-place messy coordinates. Leave `layout.mode` as `auto` unless the user provides exact geometry. The script will standardize box sizes, deduplicate repeated connectors, and choose a layout engine.
+   - For system/module structure charts, prefer the default `compact-tree` engine. It creates a human-style column tree instead of a loose force/grid drawing.
    - Mark uncertain labels, arrow directions, or relationships in the final response.
 
 4. **Apply editable shapes**
@@ -34,7 +35,7 @@ Use editable Word drawing objects for diagrams in `.docx` documents. Do not sati
      ```bash
      python3 scripts/docx_shape_diagram.py apply <input.docx> --spec <diagram.json> --out <output.docx>
      ```
-   - The script writes editable VML/Word drawing shapes into the DOCX. Auto layout is the default; use `--layout manual` only for carefully measured coordinates.
+   - The script writes editable VML/Word drawing shapes into the DOCX using a virtual-coordinate VML group, the same style as manually patched Word diagrams. Auto layout is the default; use `--layout manual` only for carefully measured coordinates.
    - If precise Word-native editing is required, use LibreOffice UNO or Microsoft Word automation guidance in `references/tooling.md`.
 
 5. **Validate**
@@ -43,6 +44,7 @@ Use editable Word drawing objects for diagrams in `.docx` documents. Do not sati
      python3 scripts/docx_shape_diagram.py validate <output.docx>
      ```
    - Confirm the output contains editable drawing shapes and that converted diagrams were not replaced by a new raster image.
+   - Render with LibreOffice and inspect the page image before delivering important diagrams.
 
 ## Placement Rules
 
@@ -55,8 +57,8 @@ Use editable Word drawing objects for diagrams in `.docx` documents. Do not sati
 
 ## Tooling Preference
 
-- Primary deterministic path: `scripts/docx_shape_diagram.py` with direct DOCX shape markup.
-- Preferred GUI/automation enhancement: `/Applications/LibreOffice.app/Contents/MacOS/soffice` with UNO for visual inspection and shape adjustments.
+- Primary deterministic path: `scripts/docx_shape_diagram.py` with direct DOCX VML group markup and `dot`/Graphviz-assisted layout when useful.
+- Preferred GUI/automation enhancement: `/Applications/LibreOffice.app/Contents/MacOS/soffice` with UNO or PDF/PNG rendering for visual inspection and shape adjustments.
 - Fallback for final fidelity checks: Microsoft Word, especially when the user needs exact Word UI compatibility.
 
 ## References

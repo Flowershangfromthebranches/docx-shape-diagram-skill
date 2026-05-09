@@ -23,7 +23,7 @@ Use this JSON format when creating editable DOCX diagrams with `scripts/docx_sha
 
 Coordinates are points relative to the top-left of the diagram canvas. Use 72 points per inch.
 
-By default, `apply` ignores rough node coordinates and normalizes the diagram onto a clean layered grid. Add `"layout": { "mode": "manual" }` or pass `--layout manual` only when coordinates are already carefully measured.
+By default, `apply` ignores rough node coordinates and normalizes the diagram. Add `"layout": { "mode": "manual" }` or pass `--layout manual` only when coordinates are already carefully measured.
 
 ## Layout
 
@@ -43,14 +43,27 @@ Recommended generated specs should include semantic relationships first and leav
 }
 ```
 
-Auto layout:
+Auto layout engines:
 
-- Assigns graph layers from connector direction.
-- Centers each layer on a common canvas.
-- Keeps the canvas within a page-friendly default width of 500pt and wraps crowded layers. Set `layout.max_canvas_width` only when a wider landscape-style diagram is intentional.
+- `compact-tree` (default): best for system function/module charts. It places the root at the top, first-level modules in columns, and each module's children vertically beneath it.
+- `graphviz`: best for general directed graphs that fit the page. It uses local `dot` to compute a cleaner directed layout, then writes editable Word shapes.
+- `grid`: deterministic fallback when Graphviz is unavailable or a very compact page width is required.
+- All engines keep the canvas page-friendly by default. Set `layout.max_canvas_width` only when a wider landscape-style diagram is intentional.
 - Uses consistent node widths and heights based on label length.
 - Deduplicates repeated connectors.
 - Routes arrows as simple vertical or orthogonal lines.
+
+To force an engine:
+
+```json
+{ "layout": { "mode": "auto", "engine": "graphviz" } }
+```
+
+Or pass:
+
+```bash
+python3 scripts/docx_shape_diagram.py apply input.docx --spec diagram.json --out output.docx --engine compact-tree
+```
 
 Manual layout:
 
@@ -108,6 +121,8 @@ For E-R diagrams, put cardinalities in `label`, `start_label`, or `end_label`. F
 
 - Use stable IDs; connectors must refer to existing node IDs.
 - Prefer auto layout for newly generated diagrams.
+- For system function structures, use `compact-tree`.
+- For E-R diagrams with manually understood semantics, place entities and relationship diamonds deliberately or use `--layout manual`.
 - Keep all nodes within the canvas when using manual layout.
 - Keep labels short enough to fit their boxes.
 - Prefer orthogonal or simple straight connectors. Avoid dense crossing lines and duplicate arrows.
